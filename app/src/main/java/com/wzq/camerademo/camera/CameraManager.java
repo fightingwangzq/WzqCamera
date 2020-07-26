@@ -3,14 +3,17 @@ package com.wzq.camerademo.camera;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.graphics.Camera;
+import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.TotalCaptureResult;
+import android.media.Image;
+import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
@@ -21,7 +24,11 @@ import android.view.TextureView;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 
-import java.util.Collections;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
 
 public class CameraManager {
     private final static String TAG = "CameraManager";
@@ -36,11 +43,15 @@ public class CameraManager {
     private CaptureRequest mPreviewRequest;
     private CameraCaptureSession mCameraCaptureSession;
 
-    private HandlerThread mCameraHandlerThread;
-    private Handler mCameraHandler;
+    private ImageReader mCaptureImageReader;
+
+    private HandlerThread mCameraPreviewHandlerThread;
+    private Handler mCameraPreviewHandler;
+
+    private HandlerThread mCameraCaptureHandlerThread;
+    private Handler mCameraCaptureHandler;
 
     private Size mPreviewSize;
-    private Size mCaptureSize;
     private int mCameraDevices;
 
     private CameraCharacteristics mFrontCameraCharacteristics;
@@ -67,6 +78,7 @@ public class CameraManager {
     private void cameraPreProcess(int width, int height) {
         mPreviewSize = new Size(width, height);
         setupCamera();
+        mCaptureImageReader = ImageReader.newInstance(mPreviewSize.getWidth(), mPreviewSize.getHeight(), ImageFormat.JPEG, 2);
     }
 
     private void setupCamera() {
@@ -95,18 +107,22 @@ public class CameraManager {
     }
 
     private void startCameraThread() {
-        mCameraHandlerThread = new HandlerThread("CameraHandlerThread");
-        mCameraHandlerThread.start();
-        mCameraHandler = new Handler(mCameraHandlerThread.getLooper());
+        mCameraPreviewHandlerThread = new HandlerThread("CameraPreviewHandlerThread");
+        mCameraPreviewHandlerThread.start();
+        mCameraPreviewHandler = new Handler(mCameraPreviewHandlerThread.getLooper());
+
+        mCameraCaptureHandlerThread = new HandlerThread("CameraCaptureHandlerThread");
+        mCameraCaptureHandlerThread.start();
+        mCameraCaptureHandler = new Handler(mCameraCaptureHandlerThread.getLooper());
     }
 
     private void stopCameraThread() {
-        if (mCameraHandlerThread != null) {
-            mCameraHandlerThread.quitSafely();
+        if (mCameraPreviewHandlerThread != null) {
+            mCameraPreviewHandlerThread.quitSafely();
             try {
-                mCameraHandlerThread.join();
-                mCameraHandlerThread = null;
-                mCameraHandler = null;
+                mCameraPreviewHandlerThread.join();
+                mCameraPreviewHandlerThread = null;
+                mCameraPreviewHandler = null;
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
@@ -131,7 +147,7 @@ public class CameraManager {
                 Log.e(TAG, "no camera permission");
                 return;
             }
-            mCameraManager.openCamera(cameraId, mCameraDeviceStateCallback, mCameraHandler);
+            mCameraManager.openCamera(cameraId, mCameraDeviceStateCallback, mCameraPreviewHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -190,8 +206,9 @@ public class CameraManager {
         mSurface = previewSurface;
         try {
             mPreviewRequestBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            mPreviewRequestBuilder.addTarget(previewSurface);
-            mCameraDevice.createCaptureSession(Collections.singletonList(previewSurface), mCaptureSessionStateCallback, mCameraHandler);
+            mPreviewRequestBuilder.addTarget(mSurface);
+            mCaptureImageReader.setOnImageAvailableListener(mOnImageAvailableListener, mCameraCaptureHandler);
+            mCameraDevice.createCaptureSession(Arrays.asList(mSurface, mCaptureImageReader.getSurface()), mCaptureSessionStateCallback, mCameraPreviewHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -204,7 +221,7 @@ public class CameraManager {
             mPreviewRequest = mPreviewRequestBuilder.build();
             mCameraCaptureSession = session;
             try {
-                mCameraCaptureSession.setRepeatingRequest(mPreviewRequest, null, mCameraHandler);
+                mCameraCaptureSession.setRepeatingRequest(mPreviewRequest, null, mCameraPreviewHandler);
             } catch (CameraAccessException e) {
                 e.printStackTrace();
             }
@@ -221,6 +238,11 @@ public class CameraManager {
         public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
             super.onCaptureCompleted(session, request, result);
             Log.d(TAG, "onCaptureCompleted");
+            try {
+                mCameraCaptureSession.setRepeatingRequest(mPreviewRequest, null, mCameraPreviewHandler);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
         }
     };
 
@@ -228,14 +250,58 @@ public class CameraManager {
         if (mCameraDevice == null || mCameraCaptureSession == null) return;
         try {
             final CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-            builder.addTarget(mSurface);
-
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                    CameraMetadata.CONTROL_AF_TRIGGER_START);
+            builder.addTarget(mCaptureImageReader.getSurface());
             mCameraCaptureSession.stopRepeating();
-            mCameraCaptureSession.capture(builder.build(), mCaptureCallback, mCameraHandler);
-            mCameraCaptureSession.capture(mPreviewRequestBuilder.build(), null, mCameraHandler);
-            mCameraCaptureSession.setRepeatingRequest(mPreviewRequest, null, mCameraHandler);
+            mCameraCaptureSession.abortCaptures();
+            mCameraCaptureSession.capture(builder.build(), mCaptureCallback, mCameraCaptureHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
+        }
+    }
+
+    private ImageReader.OnImageAvailableListener mOnImageAvailableListener = new ImageReader.OnImageAvailableListener() {
+        @Override
+        public void onImageAvailable(ImageReader reader) {
+            final String filePath = mContext.getExternalCacheDir().getAbsolutePath() + File.separator + "file.jpg";
+            Log.d(TAG, "capture filepath " + filePath);
+            mCameraCaptureHandler.post(new CaptureRunnable(reader.acquireNextImage(), filePath));
+        }
+    };
+
+    public class CaptureRunnable implements Runnable {
+        private Image mImage;
+        private File mFile;
+
+        public CaptureRunnable(Image image, File file) {
+            this.mImage = image;
+            this.mFile = file;
+        }
+
+        public CaptureRunnable(Image image, String filePath) {
+            this(image, new File(filePath));
+        }
+
+        @Override
+        public void run() {
+            ByteBuffer buffer = mImage.getPlanes()[0].getBuffer();
+            FileOutputStream outputStream = null;
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            try {
+                outputStream = new FileOutputStream(mFile);
+                outputStream.write(bytes);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    assert outputStream != null;
+                    outputStream.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
         }
     }
 }
